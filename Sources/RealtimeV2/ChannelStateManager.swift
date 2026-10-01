@@ -33,11 +33,11 @@ actor ChannelStateManager {
   }
 
   typealias MakeRef = @Sendable () -> String
-  typealias EnsureSocketConnected = @Sendable () async -> Bool
+  typealias EnsureSocketConnected = @Sendable () async throws -> Bool
   typealias GetClientChanges = @Sendable () -> [PostgresJoinConfig]
   typealias JoinOperation =
     @Sendable (_ joinRef: String, _ clientChanges: [PostgresJoinConfig])
-    async -> Void
+    async throws -> Void
   typealias LeaveOperation = @Sendable () async -> Void
   typealias RetryDelay = @Sendable (_ attempt: Int) -> TimeInterval
   /// Synchronous callback invoked every time the state changes. The channel
@@ -45,6 +45,20 @@ actor ChannelStateManager {
   /// reading ``RealtimeChannelV2/status`` right after ``subscribe()`` returns
   /// sees the latest value.
   typealias StateDidChange = @Sendable (State) -> Void
+
+  private enum JoinOutcome: Sendable {
+    case subscribed
+    case rejected
+    case malformedResponse
+    case closed
+    case cancelled
+  }
+
+  private struct ActiveJoinAttempt {
+    let ref: String
+    let continuation: AsyncStream<JoinOutcome>.Continuation
+    var isResolved = false
+  }
 
   private let stateSubject = AsyncValueSubject<State>(.unsubscribed)
   private let stateDidChange: StateDidChange?
@@ -60,6 +74,8 @@ actor ChannelStateManager {
 
   private(set) var joinRef: String?
   private var pushes: [String: PushV2] = [:]
+  private var activeJoinAttempt: ActiveJoinAttempt?
+  private var subscribeGeneration: UInt64 = 0
 
   // MARK: - Config & injected operations
 
@@ -175,7 +191,9 @@ actor ChannelStateManager {
 
     case .subscribing(let task):
       logger?.debug("Cancelling in-flight subscribe to unsubscribe '\(topic)'")
+      subscribeGeneration &+= 1
       task.cancel()
+      cancelPendingJoin()
       // Subscribe hadn't completed yet, so the server may not recognize the
       // channel and will likely never send `phx_close`. Don't wait for it.
       await beginUnsubscribe(waitForServerClose: false)
@@ -203,6 +221,8 @@ actor ChannelStateManager {
   /// immediately — the server's `phx_close` won't arrive on the dead socket
   /// anyway.
   func resetForReconnect() {
+    subscribeGeneration &+= 1
+    resolvePendingJoin(.closed)
     joinRef = nil
     pushes = [:]
     switch state {
@@ -223,15 +243,65 @@ actor ChannelStateManager {
   /// Called when the server confirms the `phx_join` (system.ok or phx_reply
   /// with `postgres_changes`).
   func didReceiveSubscribedOK() {
-    guard case .subscribing = state else { return }
+    didReceiveSubscribedOK(joinRef: activeJoinAttempt?.ref)
+  }
+
+  func didReceiveSubscribedOK(joinRef: String?) {
+    guard
+      let joinRef,
+      isCurrentJoinAttempt(ref: joinRef, joinRef: joinRef),
+      resolveJoinAttempt(ref: joinRef, outcome: .subscribed)
+    else {
+      return
+    }
+
     logger?.debug("Server confirmed subscribe for channel '\(topic)'")
     updateState(.subscribed)
+  }
+
+  func isCurrentJoinAttempt(ref: String?, joinRef: String?) -> Bool {
+    guard
+      let currentRef = currentJoinAttemptRef(),
+      let ref,
+      let joinRef,
+      ref == currentRef,
+      joinRef == currentRef
+    else {
+      return false
+    }
+
+    return true
+  }
+
+  func currentJoinAttemptRef() -> String? {
+    guard
+      case .subscribing = state,
+      let activeJoinAttempt,
+      !activeJoinAttempt.isResolved,
+      joinRef == activeJoinAttempt.ref
+    else {
+      return nil
+    }
+
+    return activeJoinAttempt.ref
+  }
+
+  func didReceiveJoinRejection(ref: String?, joinRef: String?) {
+    guard isCurrentJoinAttempt(ref: ref, joinRef: joinRef), let ref else { return }
+    _ = resolveJoinAttempt(ref: ref, outcome: .rejected)
+  }
+
+  func didReceiveMalformedJoinReply(ref: String?, joinRef: String?) {
+    guard isCurrentJoinAttempt(ref: ref, joinRef: joinRef), let ref else { return }
+    _ = resolveJoinAttempt(ref: ref, outcome: .malformedResponse)
   }
 
   /// Called when the server closes the channel (phx_close or system error
   /// that should drop the channel).
   func didReceiveClose() {
     logger?.debug("Server closed channel '\(topic)'")
+    subscribeGeneration &+= 1
+    resolvePendingJoin(.closed)
     joinRef = nil
     pushes = [:]
     if case .subscribing(let task) = state {
@@ -240,13 +310,36 @@ actor ChannelStateManager {
     updateState(.unsubscribed)
   }
 
+  private func cancelPendingJoin() {
+    resolvePendingJoin(.cancelled)
+  }
+
+  private func resolvePendingJoin(_ outcome: JoinOutcome) {
+    guard let ref = activeJoinAttempt?.ref else { return }
+    _ = resolveJoinAttempt(ref: ref, outcome: outcome)
+  }
+
+  @discardableResult
+  private func resolveJoinAttempt(ref: String, outcome: JoinOutcome) -> Bool {
+    guard var activeJoinAttempt, activeJoinAttempt.ref == ref, !activeJoinAttempt.isResolved else {
+      return false
+    }
+
+    activeJoinAttempt.isResolved = true
+    self.activeJoinAttempt = activeJoinAttempt
+    _ = activeJoinAttempt.continuation.yield(outcome)
+    return true
+  }
+
   // MARK: - Private
 
   private func beginSubscribe() async throws {
     logger?.debug("Beginning subscribe flow for channel '\(topic)'")
+    subscribeGeneration &+= 1
+    let generation = subscribeGeneration
     let task = Task<Void, any Error> { [weak self] in
       guard let self else { return }
-      try await self.runSubscribeAttempts()
+      try await self.runSubscribeAttempts(generation: generation)
     }
     updateState(.subscribing(task))
 
@@ -262,7 +355,7 @@ actor ChannelStateManager {
     } catch {
       // If the subscribe attempt didn't transition us to .subscribed, make
       // sure external observers see .unsubscribed.
-      if case .subscribing = state {
+      if subscribeGeneration == generation, case .subscribing = state {
         joinRef = nil
         pushes = [:]
         updateState(.unsubscribed)
@@ -271,9 +364,12 @@ actor ChannelStateManager {
     }
   }
 
-  private func runSubscribeAttempts() async throws {
+  private func runSubscribeAttempts(generation: UInt64) async throws {
     var attempts = 0
     while attempts < maxRetryAttempts {
+      guard subscribeGeneration == generation, case .subscribing = state else {
+        throw CancellationError()
+      }
       attempts += 1
 
       do {
@@ -305,13 +401,10 @@ actor ChannelStateManager {
           "Retrying subscribe for '\(topic)' in \(String(format: "%.2f", delay))s"
         )
 
-        do {
-          try await _clock.sleep(for: .seconds(delay))
-          if !(await ensureSocketConnected()) {
-            logger?.debug("Socket disconnected during retry delay for '\(topic)'")
-            throw CancellationError()
-          }
-        } catch {
+        try await _clock.sleep(for: .seconds(delay))
+        try Task.checkCancellation()
+        if !(try await ensureSocketConnected()) {
+          logger?.debug("Socket disconnected during retry delay for '\(topic)'")
           throw CancellationError()
         }
       }
@@ -321,9 +414,10 @@ actor ChannelStateManager {
   }
 
   private func runOneSubscribeAttempt() async throws {
-    guard await ensureSocketConnected() else {
+    guard try await ensureSocketConnected() else {
       throw CancellationError()
     }
+    try Task.checkCancellation()
 
     let ref = makeRef()
     joinRef = ref
@@ -331,24 +425,48 @@ actor ChannelStateManager {
     // `onPostgresChange` can append synchronously without a racy
     // fire-and-forget Task.
     let changes = getClientChanges()
-
-    await joinOperation(ref, changes)
-
-    for await observed in stateSubject.values {
-      try Task.checkCancellation()
-      switch observed {
-      case .subscribed:
-        return
-      case .unsubscribed:
-        // Channel was closed (by server or unsubscribe) while we were
-        // waiting. Abort this attempt; the outer flow decides whether to
-        // retry or propagate.
-        throw CancellationError()
-      case .subscribing, .unsubscribing:
-        continue
+    let (outcomes, continuation) = AsyncStream<JoinOutcome>.makeStream(
+      bufferingPolicy: .bufferingNewest(1)
+    )
+    activeJoinAttempt = ActiveJoinAttempt(ref: ref, continuation: continuation)
+    defer {
+      if activeJoinAttempt?.ref == ref {
+        activeJoinAttempt?.continuation.finish()
+        activeJoinAttempt = nil
+      } else {
+        continuation.finish()
       }
     }
-    throw CancellationError()
+
+    try await withTaskCancellationHandler {
+      try Task.checkCancellation()
+      try await joinOperation(ref, changes)
+
+      for await outcome in outcomes {
+        try Task.checkCancellation()
+        switch outcome {
+        case .subscribed:
+          guard case .subscribed = state, joinRef == ref else {
+            throw CancellationError()
+          }
+          return
+        case .rejected:
+          throw RealtimeSubscribeError.joinRejected
+        case .malformedResponse:
+          throw RealtimeError("Received a malformed channel join reply.")
+        case .closed, .cancelled:
+          throw CancellationError()
+        }
+      }
+
+      throw CancellationError()
+    } onCancel: {
+      Task { await self.cancelJoinAttempt(ref: ref) }
+    }
+  }
+
+  private func cancelJoinAttempt(ref: String) {
+    _ = resolveJoinAttempt(ref: ref, outcome: .cancelled)
   }
 
   private func beginUnsubscribe(waitForServerClose: Bool) async {

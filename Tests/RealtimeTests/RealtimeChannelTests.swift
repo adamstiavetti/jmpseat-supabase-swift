@@ -5,6 +5,7 @@
 //  Created by Guilherme Souza on 09/09/24.
 //
 
+import ConcurrencyExtras
 import Foundation
 import InlineSnapshotTesting
 import TestHelpers
@@ -32,6 +33,414 @@ final class RealtimeChannelTests: XCTestCase {
     ),
     logger: nil
   )
+
+  @MainActor
+  func testSubscribeWithErrorClassifiesOnlyKnownTransientTransportFailures() async {
+    for code in [URLError.Code.notConnectedToInternet, .networkConnectionLost] {
+      let transportCalls = LockIsolated(0)
+      let socket = makeSocket(maxRetryAttempts: 1) { _, _ in
+        transportCalls.withValue { $0 += 1 }
+        throw WebSocketError.connection(
+          message: "connection failed",
+          error: URLError(code)
+        )
+      }
+
+      do {
+        try await socket.channel("test-topic").subscribeWithError()
+        XCTFail("Expected a transient transport failure for \(code)")
+      } catch let error as RealtimeSubscribeError {
+        XCTAssertEqual(error, .transientTransportFailure)
+      } catch {
+        XCTFail("Unexpected error for \(code): \(error)")
+      }
+
+      XCTAssertEqual(transportCalls.value, 1)
+      guard case .disconnected = socket.status else {
+        return XCTFail("Expected the socket to remain disconnected")
+      }
+    }
+  }
+
+  @MainActor
+  func testSubscribeWithErrorDoesNotClassifyTimeoutHandshakeOrUnknownFailuresAsTransient()
+    async
+  {
+    let failures: [any Error] = [
+      WebSocketError.connection(message: "connection failed", error: URLError(.timedOut)),
+      WebSocketError.connection(message: "connection failed", error: URLError(.cancelled)),
+      WebSocketError.connection(
+        message: "connection failed",
+        error: URLError(.userAuthenticationRequired)
+      ),
+      WebSocketError.connection(message: "connection failed", error: URLError(.badServerResponse)),
+      WebSocketError.connection(
+        message: "connection failed",
+        error: NSError(domain: "UnknownTransport", code: 1)
+      ),
+    ]
+
+    for failure in failures {
+      let transportCalls = LockIsolated(0)
+      let socket = makeSocket(maxRetryAttempts: 5) { _, _ in
+        transportCalls.withValue { $0 += 1 }
+        throw failure
+      }
+
+      do {
+        try await socket.channel("test-topic").subscribeWithError()
+        XCTFail("Expected the connection failure to be surfaced")
+      } catch {
+        XCTAssertFalse(error is RealtimeSubscribeError)
+      }
+
+      XCTAssertEqual(transportCalls.value, 1)
+      guard case .disconnected = socket.status else {
+        return XCTFail("Expected the socket to remain disconnected")
+      }
+    }
+  }
+
+  @MainActor
+  func testPublicConnectRemainsNonThrowingForTransportFailure() async {
+    let socket = makeSocket(maxRetryAttempts: 1) { _, _ in
+      throw WebSocketError.connection(
+        message: "connection failed",
+        error: URLError(.notConnectedToInternet)
+      )
+    }
+
+    await socket.connect()
+
+    guard case .disconnected = socket.status else {
+      return XCTFail("Expected public connect() to remain non-throwing and disconnected")
+    }
+  }
+
+  @MainActor
+  func testSubscribeWithErrorReturnsCorrelatedJoinRejectionWithoutRetry() async {
+    let (client, server) = FakeWebSocket.fakes()
+    let joinCount = LockIsolated(0)
+    let socket = makeSocket(maxRetryAttempts: 5) { _, _ in client }
+    let channel = socket.channel("test-topic")
+
+    let serverTask = Task { @Sendable in
+      for await event in server.events {
+        guard let message = event.realtimeMessage, message.event == "phx_join" else {
+          continue
+        }
+        joinCount.withValue { $0 += 1 }
+        server.send(
+          RealtimeMessageV2(
+            joinRef: message.joinRef,
+            ref: message.ref,
+            topic: message.topic,
+            event: "phx_reply",
+            payload: [
+              "status": "error",
+              "response": ["reason": "private authorization detail"],
+            ]
+          )
+        )
+      }
+    }
+    defer {
+      serverTask.cancel()
+      socket.disconnect()
+    }
+
+    do {
+      try await channel.subscribeWithError()
+      XCTFail("Expected the server rejection to be surfaced")
+    } catch let error as RealtimeSubscribeError {
+      XCTAssertEqual(error, .joinRejected)
+      XCTAssertFalse(error.localizedDescription.contains("private authorization detail"))
+    } catch {
+      XCTFail("Unexpected error: \(error)")
+    }
+
+    XCTAssertEqual(joinCount.value, 1)
+    XCTAssertEqual(channel.status, .unsubscribed)
+  }
+
+  @MainActor
+  func testMalformedCorrelatedJoinReplyFailsClosedWithoutRetry() async {
+    let (client, server) = FakeWebSocket.fakes()
+    let joinCount = LockIsolated(0)
+    let socket = makeSocket(maxRetryAttempts: 5) { _, _ in client }
+    let channel = socket.channel("test-topic")
+
+    let serverTask = Task { @Sendable in
+      for await event in server.events {
+        guard let message = event.realtimeMessage, message.event == "phx_join" else {
+          continue
+        }
+        joinCount.withValue { $0 += 1 }
+        server.send(
+          RealtimeMessageV2(
+            joinRef: message.joinRef,
+            ref: message.ref,
+            topic: message.topic,
+            event: "phx_reply",
+            payload: ["response": ["reason": "must not be exposed"]]
+          )
+        )
+      }
+    }
+    defer {
+      serverTask.cancel()
+      socket.disconnect()
+    }
+
+    do {
+      try await channel.subscribeWithError()
+      XCTFail("Expected the malformed join reply to fail")
+    } catch {
+      XCTAssertFalse(error is RealtimeSubscribeError)
+      XCTAssertFalse(error.localizedDescription.contains("must not be exposed"))
+    }
+
+    XCTAssertEqual(joinCount.value, 1)
+    XCTAssertEqual(channel.status, .unsubscribed)
+  }
+
+  @MainActor
+  func testJoinReplyMissingPushRefFailsClosedWithoutRetry() async {
+    let (client, server) = FakeWebSocket.fakes()
+    let joinCount = LockIsolated(0)
+    let socket = makeSocket(maxRetryAttempts: 5) { _, _ in client }
+    let channel = socket.channel("test-topic")
+
+    let serverTask = Task { @Sendable in
+      for await event in server.events {
+        guard let message = event.realtimeMessage, message.event == "phx_join" else {
+          continue
+        }
+        joinCount.withValue { $0 += 1 }
+        server.send(
+          RealtimeMessageV2(
+            joinRef: message.joinRef,
+            ref: nil,
+            topic: message.topic,
+            event: "phx_reply",
+            payload: ["status": "error", "response": [:]]
+          )
+        )
+      }
+    }
+    defer {
+      serverTask.cancel()
+      socket.disconnect()
+    }
+
+    do {
+      try await channel.subscribeWithError()
+      XCTFail("Expected the malformed join reply to fail")
+    } catch {
+      XCTAssertFalse(error is RealtimeSubscribeError)
+    }
+
+    XCTAssertEqual(joinCount.value, 1)
+    XCTAssertEqual(channel.status, .unsubscribed)
+  }
+
+  @MainActor
+  func testJoinErrorWithoutStructuredResponseIsNotClassifiedAsRejection() async {
+    let (client, server) = FakeWebSocket.fakes()
+    let joinCount = LockIsolated(0)
+    let socket = makeSocket(maxRetryAttempts: 5) { _, _ in client }
+    let channel = socket.channel("test-topic")
+
+    let serverTask = Task { @Sendable in
+      for await event in server.events {
+        guard let message = event.realtimeMessage, message.event == "phx_join" else {
+          continue
+        }
+        joinCount.withValue { $0 += 1 }
+        server.send(
+          RealtimeMessageV2(
+            joinRef: message.joinRef,
+            ref: message.ref,
+            topic: message.topic,
+            event: "phx_reply",
+            payload: ["status": "error"]
+          )
+        )
+      }
+    }
+    defer {
+      serverTask.cancel()
+      socket.disconnect()
+    }
+
+    do {
+      try await channel.subscribeWithError()
+      XCTFail("Expected the malformed join error to fail")
+    } catch {
+      XCTAssertFalse(error is RealtimeSubscribeError)
+    }
+
+    XCTAssertEqual(joinCount.value, 1)
+    XCTAssertEqual(channel.status, .unsubscribed)
+  }
+
+  @MainActor
+  func testSystemTimeoutDuringJoinIsNotClassifiedAsRejection() async {
+    let (client, server) = FakeWebSocket.fakes()
+    let joinCount = LockIsolated(0)
+    let socket = makeSocket(maxRetryAttempts: 5) { _, _ in client }
+    let channel = socket.channel("test-topic")
+
+    let serverTask = Task { @Sendable in
+      for await event in server.events {
+        guard let message = event.realtimeMessage, message.event == "phx_join" else {
+          continue
+        }
+        joinCount.withValue { $0 += 1 }
+        server.send(
+          RealtimeMessageV2(
+            joinRef: message.joinRef,
+            ref: nil,
+            topic: message.topic,
+            event: ChannelEvent.system,
+            payload: ["status": "timeout"]
+          )
+        )
+      }
+    }
+    defer {
+      serverTask.cancel()
+      socket.disconnect()
+    }
+
+    do {
+      try await channel.subscribeWithError()
+      XCTFail("Expected the system timeout to fail the subscribe")
+    } catch {
+      XCTAssertFalse(error is RealtimeSubscribeError)
+    }
+
+    XCTAssertEqual(joinCount.value, 1)
+    XCTAssertEqual(channel.status, .unsubscribed)
+  }
+
+  @MainActor
+  func testStaleJoinRejectionDoesNotBlockCurrentCorrelatedJoin() async throws {
+    let (client, server) = FakeWebSocket.fakes()
+    let joinCount = LockIsolated(0)
+    let socket = makeSocket(maxRetryAttempts: 1) { _, _ in client }
+    let channel = socket.channel("test-topic")
+
+    let serverTask = Task { @Sendable in
+      for await event in server.events {
+        guard let message = event.realtimeMessage, message.event == "phx_join" else {
+          continue
+        }
+        joinCount.withValue { $0 += 1 }
+        server.send(
+          RealtimeMessageV2(
+            joinRef: "stale-join",
+            ref: "stale-join",
+            topic: message.topic,
+            event: "phx_reply",
+            payload: ["status": "error", "response": [:]]
+          )
+        )
+        server.send(
+          RealtimeMessageV2(
+            joinRef: message.joinRef,
+            ref: message.ref,
+            topic: message.topic,
+            event: "phx_reply",
+            payload: ["status": "ok", "response": ["postgres_changes": []]]
+          )
+        )
+      }
+    }
+    defer {
+      serverTask.cancel()
+      socket.disconnect()
+    }
+
+    try await channel.subscribeWithError()
+
+    XCTAssertEqual(joinCount.value, 1)
+    XCTAssertEqual(channel.status, .subscribed)
+  }
+
+  @MainActor
+  func testReconnectDuringAccessTokenLookupDoesNotSendObsoleteJoin() async throws {
+    let tokenGate = TokenGate()
+    let (client, server) = FakeWebSocket.fakes()
+    let socket = makeSocket(
+      maxRetryAttempts: 1,
+      accessToken: { await tokenGate.token() },
+      wsTransport: { _, _ in client }
+    )
+    let channel = socket.channel("test-topic")
+
+    let firstSubscribe = Task { try await channel.subscribeWithError() }
+    guard await tokenGate.waitForRequestCount(1) else {
+      firstSubscribe.cancel()
+      await tokenGate.resumeAll(with: nil)
+      _ = await firstSubscribe.result
+      return XCTFail("The initial join should request an access token")
+    }
+    let staleJoinRef = await channel.stateManager.joinRef!
+
+    await channel.resetForReconnect()
+
+    let secondSubscribe = Task { try await channel.subscribeWithError() }
+    guard await tokenGate.waitForRequestCount(2) else {
+      firstSubscribe.cancel()
+      secondSubscribe.cancel()
+      await tokenGate.resumeAll(with: nil)
+      _ = await firstSubscribe.result
+      _ = await secondSubscribe.result
+      return XCTFail("The rejoined channel should request a fresh access token")
+    }
+    let currentJoinRef = await channel.stateManager.joinRef!
+    XCTAssertNotEqual(staleJoinRef, currentJoinRef)
+
+    await tokenGate.resumeNext(with: "stale-token")
+    do {
+      try await firstSubscribe.value
+      XCTFail("The old subscribe must be cancelled by reconnect reset")
+    } catch is CancellationError {
+      // Expected.
+    } catch {
+      XCTFail("Unexpected stale subscribe error: \(error)")
+    }
+
+    XCTAssertTrue(
+      client.sentEvents.compactMap(\.realtimeMessage).allSatisfy { $0.event != "phx_join" },
+      "The stale access-token continuation must not send an old join"
+    )
+
+    await tokenGate.resumeNext(with: "current-token")
+    let joins = await waitForSentEvents(in: client, event: "phx_join", timeout: 1)
+    XCTAssertEqual(joins.map(\.ref), [currentJoinRef])
+
+    server.send(
+      RealtimeMessageV2(
+        joinRef: staleJoinRef,
+        ref: staleJoinRef,
+        topic: "realtime:test-topic",
+        event: "phx_reply",
+        payload: ["status": "error", "response": ["reason": "stale denial"]]
+      )
+    )
+    server.send(
+      RealtimeMessageV2(
+        joinRef: currentJoinRef,
+        ref: currentJoinRef,
+        topic: "realtime:test-topic",
+        event: "phx_reply",
+        payload: ["status": "ok", "response": ["postgres_changes": []]]
+      )
+    )
+    try await secondSubscribe.value
+  }
 
   func testTypedFilterAndSelectAreBufferedIntoPostgresJoinConfig() {
     let subscription = sut.onPostgresChange(
@@ -376,6 +785,25 @@ final class RealtimeChannelTests: XCTestCase {
 
       """
     }
+  }
+
+  private func makeSocket(
+    maxRetryAttempts: Int,
+    accessToken: (@Sendable () async throws -> String?)? = nil,
+    wsTransport: @escaping WebSocketTransport
+  ) -> RealtimeClientV2 {
+    RealtimeClientV2(
+      url: URL(string: "https://localhost:54321/realtime/v1")!,
+      options: RealtimeClientOptions(
+        headers: ["apikey": "test-key"],
+        timeoutInterval: 0.1,
+        maxRetryAttempts: maxRetryAttempts,
+        accessToken: accessToken,
+        handleAppLifecycle: false
+      ),
+      wsTransport: wsTransport,
+      http: HTTPClientMock()
+    )
   }
 
   @MainActor
@@ -831,5 +1259,62 @@ extension RealtimeChannelTests {
     }
 
     return []
+  }
+
+  @MainActor
+  private func waitForSentEvents(
+    in socket: FakeWebSocket,
+    event: String,
+    timeout: TimeInterval,
+    pollInterval: UInt64 = 10_000_000
+  ) async -> [RealtimeMessageV2] {
+    let deadline = Date().addingTimeInterval(timeout)
+
+    while Date() < deadline {
+      let events = socket.sentEvents.compactMap(\.realtimeMessage).filter {
+        $0.event == event
+      }
+
+      if !events.isEmpty {
+        return events
+      }
+
+      try? await Task.sleep(nanoseconds: pollInterval)
+    }
+
+    return []
+  }
+}
+
+private actor TokenGate {
+  private var requestCount = 0
+  private var continuations: [CheckedContinuation<String?, Never>] = []
+
+  func token() async -> String? {
+    requestCount += 1
+    return await withCheckedContinuation { continuation in
+      continuations.append(continuation)
+    }
+  }
+
+  func waitForRequestCount(_ count: Int, timeout: TimeInterval = 1) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while requestCount < count && Date() < deadline {
+      try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    return requestCount >= count
+  }
+
+  func resumeNext(with token: String?) {
+    guard !continuations.isEmpty else { return }
+    continuations.removeFirst().resume(returning: token)
+  }
+
+  func resumeAll(with token: String?) {
+    let pending = continuations
+    continuations.removeAll()
+    for continuation in pending {
+      continuation.resume(returning: token)
+    }
   }
 }

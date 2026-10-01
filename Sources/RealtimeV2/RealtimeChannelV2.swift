@@ -196,13 +196,13 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
           )
           return false
         }
-        await socket.connect()
+        try await socket.connectForSubscribe()
         return socket.status == .connected
       },
       getClientChanges: { clientChanges.value },
       joinOperation: { [weakSelfRef] ref, changes in
         guard let channel = weakSelfRef.value else { return }
-        await channel.performJoin(ref: ref, clientChanges: changes)
+        try await channel.performJoin(ref: ref, clientChanges: changes)
       },
       leaveOperation: { [weakSelfRef] in
         guard let channel = weakSelfRef.value else { return }
@@ -238,7 +238,9 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
   /// All callbacks (broadcast, presence, postgres changes) must be registered before calling
   /// this method. Calling it more than once on an already-subscribed channel is a no-op.
   ///
-  /// - Throws: A ``RealtimeError`` if the subscribe attempt fails or times out.
+  /// - Throws: ``RealtimeSubscribeError/transientTransportFailure`` for an allowlisted transient
+  ///   connection failure, ``RealtimeSubscribeError/joinRejected`` for a correlated server
+  ///   rejection, or the existing timeout and cancellation errors for other failures.
   public func subscribeWithError() async throws {
     logger?.debug("Subscribe requested for channel '\(topic)'")
     try await stateManager.subscribe()
@@ -267,8 +269,9 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
   /// Invoked by ``ChannelStateManager`` via the ``ChannelStateManager/JoinOperation``
   /// closure at the moment the state machine is ready to join.
   @MainActor
-  private func performJoin(ref: String, clientChanges: [PostgresJoinConfig]) async {
+  private func performJoin(ref: String, clientChanges: [PostgresJoinConfig]) async throws {
     logger?.debug("Sending phx_join for channel '\(topic)' (ref: \(ref))")
+    try Task.checkCancellation()
 
     config.presence.enabled = callbackManager.callbacks.contains(where: { $0.isPresence })
 
@@ -279,16 +282,20 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
       isPrivate: config.isPrivate
     )
 
+    let accessToken = await socket._getAccessToken()
+    try Task.checkCancellation()
+
     let payload = RealtimeJoinPayload(
       config: joinConfig,
-      accessToken: await socket._getAccessToken(),
+      accessToken: accessToken,
       version: socket.options.headers[.xClientInfo]
     )
 
     await push(
       ChannelEvent.join,
       ref: ref,
-      payload: try! JSONObject(payload)
+      payload: try! JSONObject(payload),
+      requiringJoinRef: ref
     )
   }
 
@@ -615,35 +622,124 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
         break
 
       case .system:
-        if message.status == .ok {
-          await stateManager.didReceiveSubscribedOK()
-        } else {
-          logger?.debug(
-            "Failed to subscribe to channel \(message.topic): \(message.payload)"
-          )
+        if message.topic == topic, let joinRef = message.joinRef {
+          if message.status == .ok {
+            await stateManager.didReceiveSubscribedOK(joinRef: joinRef)
+          } else if await stateManager.isCurrentJoinAttempt(ref: joinRef, joinRef: joinRef) {
+            // System notifications do not have a push ref. During a join, its
+            // join ref is also the join push ref, so complete that push before
+            // resolving the correlated outcome and unblocking the join task.
+            await didReceiveReply(ref: joinRef, status: "error")
+            if message.status == .error {
+              await stateManager.didReceiveJoinRejection(ref: joinRef, joinRef: joinRef)
+            } else {
+              await stateManager.didReceiveMalformedJoinReply(ref: joinRef, joinRef: joinRef)
+            }
+          }
+        }
+
+        if message.status != .ok {
+          logger?.debug("Received a non-success system status for channel '\(topic)'")
         }
 
         callbackManager.triggerSystem(message: message)
 
       case .reply:
-        guard
-          let ref = message.ref,
-          let status = message.payload["status"]?.stringValue
-        else {
-          throw RealtimeError("Received a reply with unexpected payload: \(message)")
+        let currentJoinRef: String?
+        if message.topic == topic {
+          currentJoinRef = await stateManager.currentJoinAttemptRef()
+        } else {
+          currentJoinRef = nil
+        }
+
+        let isCurrentJoinReply =
+          currentJoinRef != nil
+          && message.ref == currentJoinRef
+          && message.joinRef == currentJoinRef
+        let hasMalformedCurrentJoinCorrelation =
+          currentJoinRef != nil
+          && ((message.ref == currentJoinRef && message.joinRef != currentJoinRef)
+            || (message.ref == nil && message.joinRef == currentJoinRef))
+
+        if hasMalformedCurrentJoinCorrelation, let currentJoinRef {
+          await didReceiveReply(ref: currentJoinRef, status: "error")
+          await stateManager.didReceiveMalformedJoinReply(
+            ref: currentJoinRef,
+            joinRef: currentJoinRef
+          )
+          return
+        }
+
+        guard let ref = message.ref else {
+          throw RealtimeError("Received a reply with an unexpected payload.")
+        }
+
+        guard let status = message.payload["status"]?.stringValue else {
+          if isCurrentJoinReply {
+            await didReceiveReply(ref: ref, status: "error")
+            await stateManager.didReceiveMalformedJoinReply(
+              ref: ref,
+              joinRef: message.joinRef
+            )
+            return
+          }
+          throw RealtimeError("Received a reply with unexpected payload.")
         }
 
         await didReceiveReply(ref: ref, status: status)
 
+        if isCurrentJoinReply {
+          switch status {
+          case "error":
+            guard message.payload["response"]?.objectValue != nil else {
+              await stateManager.didReceiveMalformedJoinReply(
+                ref: ref,
+                joinRef: message.joinRef
+              )
+              return
+            }
+            await stateManager.didReceiveJoinRejection(ref: ref, joinRef: message.joinRef)
+            return
+          case "ok":
+            break
+          default:
+            await stateManager.didReceiveMalformedJoinReply(
+              ref: ref,
+              joinRef: message.joinRef
+            )
+            return
+          }
+
+          guard message.payload["response"]?.objectValue != nil else {
+            await stateManager.didReceiveMalformedJoinReply(
+              ref: ref,
+              joinRef: message.joinRef
+            )
+            return
+          }
+        }
+
         if message.payload["response"]?.objectValue?.keys
           .contains(ChannelEvent.postgresChanges) == true
         {
-          let serverPostgresChanges = try message.payload["response"]?
-            .objectValue?["postgres_changes"]?
-            .decode(as: [PostgresJoinConfig].self)
+          guard isCurrentJoinReply else { return }
 
-          callbackManager.setServerChanges(changes: serverPostgresChanges ?? [])
-          await stateManager.didReceiveSubscribedOK()
+          let serverPostgresChanges: [PostgresJoinConfig]
+          do {
+            serverPostgresChanges =
+              try message.payload["response"]?
+              .objectValue?["postgres_changes"]?
+              .decode(as: [PostgresJoinConfig].self) ?? []
+          } catch {
+            await stateManager.didReceiveMalformedJoinReply(
+              ref: ref,
+              joinRef: message.joinRef
+            )
+            return
+          }
+
+          callbackManager.setServerChanges(changes: serverPostgresChanges)
+          await stateManager.didReceiveSubscribedOK(joinRef: message.joinRef)
         }
 
       case .postgresChanges:
@@ -1171,8 +1267,21 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
 
   @MainActor
   @discardableResult
-  func push(_ event: String, ref: String? = nil, payload: JSONObject = [:]) async -> PushStatus {
+  func push(
+    _ event: String,
+    ref: String? = nil,
+    payload: JSONObject = [:],
+    requiringJoinRef expectedJoinRef: String? = nil
+  ) async -> PushStatus {
+    if expectedJoinRef != nil && Task.isCancelled {
+      return .error
+    }
+
     let joinRef = await stateManager.joinRef
+    guard expectedJoinRef == nil || expectedJoinRef == joinRef else {
+      return .error
+    }
+
     let message = RealtimeMessageV2(
       joinRef: joinRef,
       ref: ref ?? socket.makeRef(),
@@ -1198,6 +1307,13 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
         )
         return .error
       }
+    }
+
+    if expectedJoinRef != nil && Task.isCancelled {
+      if let ref = message.ref {
+        _ = await stateManager.removePush(ref: ref)
+      }
+      return .error
     }
 
     return await push.send()

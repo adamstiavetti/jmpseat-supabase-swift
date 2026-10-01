@@ -322,6 +322,10 @@ private final class MockRealtimeClient: RealtimeClientProtocol, @unchecked Senda
     _status.setValue(.connected)
   }
 
+  func connectForSubscribe() async throws {
+    await connect()
+  }
+
   func push(_ message: RealtimeMessageV2) {
     _pushedMessages.withValue { messages in
       messages.append(message)

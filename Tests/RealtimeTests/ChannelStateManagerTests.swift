@@ -201,6 +201,45 @@ final class ChannelStateManagerTests: XCTestCase {
     }
   }
 
+  func testJoinRejectionRequiresCurrentAttemptAndCompletesOnlyOnce() async {
+    let h = makeHarness(timeoutInterval: 1, maxRetryAttempts: 1)
+    let subscribeTask = Task { try await h.sut.subscribe() }
+
+    let deadline = Date().addingTimeInterval(1)
+    while h.joinCallCount.value == 0 && Date() < deadline {
+      try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+
+    guard let activeRef = h.lastJoinRef.value else {
+      subscribeTask.cancel()
+      _ = await subscribeTask.result
+      return XCTFail("The subscribe attempt should create a join reference")
+    }
+    await h.sut.didReceiveJoinRejection(ref: "stale", joinRef: "stale")
+
+    guard case .subscribing = await h.sut.state else {
+      _ = await subscribeTask.result
+      return XCTFail("A stale rejection must not change the active subscribe")
+    }
+
+    await h.sut.didReceiveJoinRejection(ref: activeRef, joinRef: activeRef)
+    await h.sut.didReceiveJoinRejection(ref: activeRef, joinRef: activeRef)
+
+    do {
+      try await subscribeTask.value
+      XCTFail("Expected the active join rejection to fail subscribe")
+    } catch let error as RealtimeSubscribeError {
+      XCTAssertEqual(error, .joinRejected)
+    } catch {
+      XCTFail("Unexpected error: \(error)")
+    }
+
+    guard case .unsubscribed = await h.sut.state else {
+      return XCTFail("Expected .unsubscribed after the rejected join")
+    }
+    XCTAssertEqual(h.joinCallCount.value, 1)
+  }
+
   // MARK: - Unsubscribe
 
   func testUnsubscribeFromUnsubscribedIsNoOp() async {

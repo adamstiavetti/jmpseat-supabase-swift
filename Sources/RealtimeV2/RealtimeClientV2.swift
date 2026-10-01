@@ -26,6 +26,7 @@ protocol RealtimeClientProtocol: AnyObject, Sendable {
   func broadcastURL(topic: String, event: String, isPrivate: Bool) -> URL
 
   func connect() async
+  func connectForSubscribe() async throws
   func push(_ message: RealtimeMessageV2)
   func pushBroadcast(
     joinRef: String?, ref: String?, topic: String, event: String, jsonPayload: JSONObject
@@ -366,6 +367,25 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
   /// await client.connect()
   /// ```
   public func connect() async {
+    do {
+      try await connectThrowing()
+    } catch {
+      options.logger?.error("Connection failed: \(error)")
+    }
+  }
+
+  func connectForSubscribe() async throws {
+    do {
+      try await connectThrowing()
+    } catch {
+      if let subscribeError = RealtimeSubscribeError.transientTransportFailure(for: error) {
+        throw subscribeError
+      }
+      throw error
+    }
+  }
+
+  private func connectThrowing() async throws {
     options.logger?.debug("Connecting...")
     Self.yieldStatusIfChanged(statusSubject, .connecting)
 
@@ -379,8 +399,8 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
       handleConnected(conn: conn, isReconnect: false)
       Self.yieldStatusIfChanged(statusSubject, .connected)
     } catch {
-      options.logger?.error("Connection failed: \(error)")
       Self.yieldStatusIfChanged(statusSubject, .disconnected)
+      throw error
     }
   }
 

@@ -128,7 +128,9 @@ import XCTest
               )
             )
           } else if msg.event == "phx_join" {
-            server.send(.messagesSubscribed)
+            server.send(
+              .messagesSubscribed(joinRef: msg.joinRef, ref: msg.ref, topic: msg.topic)
+            )
           }
         }
       }
@@ -231,7 +233,9 @@ import XCTest
             joinEventCount.withValue { $0 += 1 }
             // Skip first join.
             if joinEventCount.value == 2 {
-              server.send(.messagesSubscribed)
+              server.send(
+                .messagesSubscribed(joinRef: msg.joinRef, ref: msg.ref, topic: msg.topic)
+              )
             }
           }
         }
@@ -338,7 +342,9 @@ import XCTest
             joinEventCount.withValue { $0 += 1 }
             // Respond on the 3rd attempt
             if joinEventCount.value == successAttempt {
-              server.send(.messagesSubscribed)
+              server.send(
+                .messagesSubscribed(joinRef: msg.joinRef, ref: msg.ref, topic: msg.topic)
+              )
             }
           }
         }
@@ -1035,22 +1041,24 @@ import XCTest
 #endif
 
 extension RealtimeMessageV2 {
-  static let messagesSubscribed = Self(
-    joinRef: nil,
-    ref: "2",
-    topic: "realtime:public:messages",
-    event: "phx_reply",
-    payload: [
-      "response": [
-        "postgres_changes": [
-          ["id": 43_783_255, "event": "INSERT", "schema": "public", "table": "messages"],
-          ["id": 124_973_000, "event": "UPDATE", "schema": "public", "table": "messages"],
-          ["id": 85_243_397, "event": "DELETE", "schema": "public", "table": "messages"],
-        ]
-      ],
-      "status": "ok",
-    ]
-  )
+  static func messagesSubscribed(joinRef: String?, ref: String?, topic: String) -> Self {
+    Self(
+      joinRef: joinRef,
+      ref: ref,
+      topic: topic,
+      event: "phx_reply",
+      payload: [
+        "response": [
+          "postgres_changes": [
+            ["id": 43_783_255, "event": "INSERT", "schema": "public", "table": "messages"],
+            ["id": 124_973_000, "event": "UPDATE", "schema": "public", "table": "messages"],
+            ["id": 85_243_397, "event": "DELETE", "schema": "public", "table": "messages"],
+          ]
+        ],
+        "status": "ok",
+      ]
+    )
+  }
 }
 
 extension FakeWebSocket {
