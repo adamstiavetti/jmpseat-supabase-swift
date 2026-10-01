@@ -27,7 +27,9 @@ protocol RealtimeClientProtocol: AnyObject, Sendable {
 
   func connect() async
   func connectForSubscribe() async throws
+  func makeJoinContext() async -> RealtimeJoinContext
   func push(_ message: RealtimeMessageV2)
+  func pushJoin(_ message: RealtimeMessageV2, context: RealtimeJoinContext)
   func pushBroadcast(
     joinRef: String?, ref: String?, topic: String, event: String, jsonPayload: JSONObject
   )
@@ -37,6 +39,26 @@ protocol RealtimeClientProtocol: AnyObject, Sendable {
   func _getAccessToken() async -> String?
   func makeRef() -> String
   func _remove(_ channel: any RealtimeChannelProtocol)
+}
+
+extension RealtimeClientProtocol {
+  func makeJoinContext() async -> RealtimeJoinContext {
+    RealtimeJoinContext(
+      accessToken: await _getAccessToken(),
+      connectionGeneration: 0,
+      authGeneration: 0
+    )
+  }
+
+  func pushJoin(_ message: RealtimeMessageV2, context: RealtimeJoinContext) {
+    push(message)
+  }
+}
+
+struct RealtimeJoinContext: Sendable {
+  let accessToken: String?
+  let connectionGeneration: UInt64
+  let authGeneration: UInt64
 }
 
 /// The entry point for Supabase Realtime subscriptions.
@@ -80,6 +102,8 @@ protocol RealtimeClientProtocol: AnyObject, Sendable {
 public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
   struct MutableState {
     var accessToken: String?
+    var authGeneration: UInt64 = 0
+    var connectionGeneration: UInt64 = 0
     var ref = 0
     var pendingHeartbeatRef: String?
 
@@ -329,6 +353,10 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
     let isNewConnection = mutableState.withValue { state -> Bool in
       if state.connection === conn { return false }
       state.connection = conn
+      // Buffered join pushes belong to the connection generation in which
+      // their token lookup began. Advance before flushing so a reconnect
+      // cannot deliver an obsolete join before channels are reset and rejoined.
+      state.connectionGeneration &+= 1
       // A heartbeat awaiting an ack on the previous connection can never be
       // acknowledged on this one. Clearing the pending ref prevents the new
       // connection's first heartbeat from misreading it as a timeout and
@@ -378,10 +406,7 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
     do {
       try await connectThrowing()
     } catch {
-      if let subscribeError = RealtimeSubscribeError.transientTransportFailure(for: error) {
-        throw subscribeError
-      }
-      throw error
+      throw RealtimeSubscribeError.sanitizedConnectionFailure(for: error)
     }
   }
 
@@ -547,6 +572,23 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
     return mutableState.accessToken
   }
 
+  func makeJoinContext() async -> RealtimeJoinContext {
+    let initialState = mutableState.withValue {
+      (connectionGeneration: $0.connectionGeneration, authGeneration: $0.authGeneration)
+    }
+    let accessToken = await _getAccessToken()
+
+    return mutableState.withValue { state in
+      RealtimeJoinContext(
+        accessToken: state.authGeneration == initialState.authGeneration
+          ? accessToken
+          : state.accessToken,
+        connectionGeneration: initialState.connectionGeneration,
+        authGeneration: state.authGeneration
+      )
+    }
+  }
+
   private func rejoinChannels() async {
     for channel in channels.values {
       await channel.resetForReconnect()
@@ -690,6 +732,7 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
     options.logger?.debug("Closing WebSocket connection")
 
     mutableState.withValue {
+      $0.connectionGeneration &+= 1
       $0.ref = 0
       $0.messageTask?.cancel()
       $0.messageTask = nil
@@ -769,12 +812,16 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
       }
     }
 
-    guard tokenToSend != mutableState.accessToken else {
-      return
+    let tokenToStore = tokenToSend
+    let didUpdateToken = mutableState.withValue { state -> Bool in
+      guard state.accessToken != tokenToStore else { return false }
+      state.accessToken = tokenToStore
+      state.authGeneration &+= 1
+      return true
     }
 
-    mutableState.withValue { [tokenToSend] in
-      $0.accessToken = tokenToSend
+    guard didUpdateToken else {
+      return
     }
 
     for channel in channels.values {
@@ -833,6 +880,17 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
   ///
   /// - Parameter message: The ``RealtimeMessageV2`` to send.
   public func push(_ message: RealtimeMessageV2) {
+    push(message, joinContext: nil)
+  }
+
+  func pushJoin(_ message: RealtimeMessageV2, context: RealtimeJoinContext) {
+    push(message, joinContext: context)
+  }
+
+  private func push(
+    _ message: RealtimeMessageV2,
+    joinContext: RealtimeJoinContext?
+  ) {
     let callback = { @Sendable (_ client: RealtimeClientV2) in
       do {
         let text: String
@@ -848,8 +906,20 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
           text = try client.serializer.encodeText(message)
         }
 
-        let conn = client.mutableState.withValue { $0.connection }
-        conn?.send(text)
+        if let joinContext {
+          client.mutableState.withValue { state in
+            guard
+              state.connectionGeneration == joinContext.connectionGeneration,
+              state.authGeneration == joinContext.authGeneration
+            else {
+              return
+            }
+            state.connection?.send(text)
+          }
+        } else {
+          let conn = client.mutableState.withValue { $0.connection }
+          conn?.send(text)
+        }
       } catch {
         client.options.logger?.error(
           """
@@ -955,9 +1025,14 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
   }
 
   private func flushSendBuffer() {
-    mutableState.withValue {
-      $0.sendBuffer.forEach { $0(self) }
-      $0.sendBuffer = []
+    let pendingCallbacks = mutableState.withValue {
+      state -> [@Sendable (RealtimeClientV2) -> Void] in
+      let callbacks = state.sendBuffer
+      state.sendBuffer = []
+      return callbacks
+    }
+    for callback in pendingCallbacks {
+      callback(self)
     }
   }
 

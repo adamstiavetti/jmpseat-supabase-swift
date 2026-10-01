@@ -26,12 +26,16 @@ final class PushV2 {
     self.message = message
   }
 
-  func send() async -> PushStatus {
+  func send(joinContext: RealtimeJoinContext? = nil) async -> PushStatus {
     guard let channel = channel else {
       return .error
     }
 
-    channel.socket.push(message)
+    if let joinContext {
+      channel.socket.pushJoin(message, context: joinContext)
+    } else {
+      channel.socket.push(message)
+    }
 
     if !channel.config.broadcast.acknowledgeBroadcasts {
       // channel was configured with `ack = false`,

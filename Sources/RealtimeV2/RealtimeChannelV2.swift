@@ -240,7 +240,8 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
   ///
   /// - Throws: ``RealtimeSubscribeError/transientTransportFailure`` for an allowlisted transient
   ///   connection failure, ``RealtimeSubscribeError/joinRejected`` for a correlated server
-  ///   rejection, or the existing timeout and cancellation errors for other failures.
+  ///   rejection, ``RealtimeSubscribeError/connectionFailed`` for other connection failures, or
+  ///   the existing timeout and cancellation errors.
   public func subscribeWithError() async throws {
     logger?.debug("Subscribe requested for channel '\(topic)'")
     try await stateManager.subscribe()
@@ -282,12 +283,12 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
       isPrivate: config.isPrivate
     )
 
-    let accessToken = await socket._getAccessToken()
+    let joinContext = await socket.makeJoinContext()
     try Task.checkCancellation()
 
     let payload = RealtimeJoinPayload(
       config: joinConfig,
-      accessToken: accessToken,
+      accessToken: joinContext.accessToken,
       version: socket.options.headers[.xClientInfo]
     )
 
@@ -295,7 +296,8 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
       ChannelEvent.join,
       ref: ref,
       payload: try! JSONObject(payload),
-      requiringJoinRef: ref
+      requiringJoinRef: ref,
+      joinContext: joinContext
     )
   }
 
@@ -1271,7 +1273,8 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
     _ event: String,
     ref: String? = nil,
     payload: JSONObject = [:],
-    requiringJoinRef expectedJoinRef: String? = nil
+    requiringJoinRef expectedJoinRef: String? = nil,
+    joinContext: RealtimeJoinContext? = nil
   ) async -> PushStatus {
     if expectedJoinRef != nil && Task.isCancelled {
       return .error
@@ -1316,7 +1319,7 @@ public final class RealtimeChannelV2: Sendable, RealtimeChannelProtocol {
       return .error
     }
 
-    return await push.send()
+    return await push.send(joinContext: joinContext)
   }
 
   @MainActor
