@@ -63,7 +63,7 @@ final class RealtimeChannelTests: XCTestCase {
   }
 
   @MainActor
-  func testSubscribeWithErrorSanitizesHandshakeAndUnknownFailures()
+  func testSubscribeWithErrorSanitizesUnclassifiedConnectionFailures()
     async
   {
     let failures: [any Error] = [
@@ -76,6 +76,8 @@ final class RealtimeChannelTests: XCTestCase {
         message: "connection failed",
         error: NSError(domain: "UnknownTransport", code: 1)
       ),
+      URLError(.networkConnectionLost),
+      URLError(.notConnectedToInternet),
     ]
 
     for failure in failures {

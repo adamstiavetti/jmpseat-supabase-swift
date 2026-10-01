@@ -97,16 +97,11 @@ public enum RealtimeSubscribeError: Error, Equatable, LocalizedError, Sendable {
   }
 
   static func transientTransportFailure(for error: any Error) -> Self? {
-    let underlyingError: any Error
-    if let webSocketError = error as? WebSocketError,
-      case .connection(_, let error) = webSocketError
-    {
-      underlyingError = error
-    } else {
-      underlyingError = error
-    }
-
-    guard let urlError = underlyingError as? URLError else {
+    guard
+      let webSocketError = error as? WebSocketError,
+      case .connection(_, let underlyingError) = webSocketError,
+      let urlError = underlyingError as? URLError
+    else {
       return nil
     }
 
